@@ -425,7 +425,7 @@ async def _store_vehicle_details(
 
         if not vin:
             msg = f"No VIN for vehicle {vehicle_id}"
-            raise MissingVINError(msg)
+            vin = "missing"
 
         data["vehicles"][vehicle_id] = {
             "vin": vin,
