@@ -16,17 +16,24 @@ from homeassistant.helpers.config_entry_oauth2_flow import (
     OAuth2Session,
     async_get_config_entry_implementation,
 )
+from homeassistant.helpers.issue_registry import IssueSeverity, async_create_issue
 from homeassistant.helpers.typing import ConfigType
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from . import util
 from .auth import AbstractAuth
 from .auth_impl import AccessTokenAuthImpl, AsyncConfigEntryAuth
-from .const import API_HOST, CONF_CLOUDHOOK, DOMAIN, PLATFORMS, Scope
+from .const import API_ENDPOINTS, CONF_CLOUDHOOK, DOMAIN, PLATFORMS, Scope
 from .coordinator import SmartcarVehicleCoordinator
-from .errors import EmptyVehicleListError, InvalidAuthError, MissingVINError
+from .errors import (
+    EmptyVehicleListError,
+    InvalidAuthError,
+    MissingVINError,
+    UnsupportedUserConfigurationError,
+)
 from .services import async_setup_services
 from .types import SmartcarData
+from .util import api_version_for_client_id
 from .webhooks import handle_webhook, webhook_url_from_id
 
 _LOGGER = logging.getLogger(__name__)
@@ -58,7 +65,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     implementation = await async_get_config_entry_implementation(hass, entry)
     websession = async_get_clientsession(hass)
     oauth_session = OAuth2Session(hass, entry, implementation)
-    auth = AsyncConfigEntryAuth(websession, oauth_session, API_HOST)
+    auth = AsyncConfigEntryAuth(
+        websession,
+        implementation,
+        oauth_session,
+        API_ENDPOINTS,
+        user_id=entry.data.get("user_id"),
+    )
     coordinators: dict[str, SmartcarVehicleCoordinator] = {}
     meta_coordinator = DataUpdateCoordinator(
         hass, _LOGGER, name=f"{DOMAIN}_meta", config_entry=entry
@@ -118,6 +131,21 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         )
     else:
         _LOGGER.debug("Webhooks are not enabled")
+
+    if auth.version == "v2":
+        async_create_issue(
+            hass,
+            DOMAIN,
+            f"legacy_client_id_{entry.entry_id}",
+            is_fixable=True,
+            is_persistent=True,
+            severity=IssueSeverity.WARNING,
+            translation_key="legacy_client_id",
+            translation_placeholders={
+                "title": entry.title,
+                "docs_url": "https://github.com/wbyoung/smartcar#upgrading-from-legacy-v2-api-to-v3",
+            },
+        )
 
     await asyncio.gather(
         *[async_do_first_refresh(coordinator) for coordinator in coordinators.values()]
@@ -197,11 +225,17 @@ async def async_migrate_entry(hass: HomeAssistant, config_entry: ConfigEntry) ->
 
     if config_entry.version == 1:
         old_data = config_entry.data
+        implementation = await async_get_config_entry_implementation(hass, config_entry)
         session = async_get_clientsession(hass)
         token = old_data[CONF_TOKEN]
         access_token = token[CONF_ACCESS_TOKEN]
         scopes = token["scope"].split(" ")
-        auth = AccessTokenAuthImpl(session, access_token, API_HOST)
+        auth = AccessTokenAuthImpl(
+            session,
+            access_token,
+            API_ENDPOINTS,
+            version=api_version_for_client_id(implementation.client_id),
+        )
 
         # copy old data & remove old keys
         new_data = {**old_data}
@@ -286,6 +320,7 @@ async def _store_all_vehicles(
 
     Raises:
         EmptyVehicleListError: If no vehicles are found.
+        UnsupportedUserConfigurationError: If there is not exactly 1 user.
         InvalidAuthError: If the request cannot be authorized.
         ClientResponseError: If there is a request error.
     """
@@ -295,13 +330,42 @@ async def _store_all_vehicles(
     data["vehicles"] = {}
 
     try:
-        vehicle_list_resp = await auth.request(
-            "get",
-            "vehicles",
-        )
-        vehicle_list_resp.raise_for_status()
-        vehicle_list_data = await vehicle_list_resp.json()
-        vehicle_ids = vehicle_list_data.get("vehicles", [])
+        if auth.version == "v2":
+            vehicle_list_resp = await auth.request_v2("get", "vehicles")
+            vehicle_list_resp.raise_for_status()
+            vehicle_list_data = await vehicle_list_resp.json()
+            vehicle_ids = vehicle_list_data.get("vehicles", [])
+        else:
+            assert auth.version == "v3"
+            connections_list_resp = await auth.request_v3("get", "connections")
+            connections_list_resp.raise_for_status()
+            connections_list_data = await connections_list_resp.json()
+            vehicle_ids = [
+                vehicle_id
+                for connection in connections_list_data.get("data", [])
+                if (
+                    vehicle_id := connection.get("relationships", {})
+                    .get("vehicle", {})
+                    .get("data", {})
+                    .get("id", None)
+                )
+            ]
+            user_ids = {
+                user_id
+                for connection in connections_list_data.get("data", [])
+                if (
+                    user_id := connection.get("relationships", {})
+                    .get("user", {})
+                    .get("data", {})
+                    .get("id", None)
+                )
+            }
+
+            if len(user_ids) != 1:
+                raise UnsupportedUserConfigurationError
+
+            auth.user_id = data["user_id"] = next(iter(user_ids))
+
     except ClientResponseError as err:
         if err.status == HTTPStatus.UNAUTHORIZED:
             msg = f"Auth error fetching vehicle list: {err.status}"
@@ -333,32 +397,49 @@ async def _store_vehicle_details(
 
     try:
         _LOGGER.debug("Fetching VIN for vehicle ID: %s", vehicle_id)
-        vin_resp = await auth.request(
-            "get",
-            f"vehicles/{vehicle_id}/vin",
-        )
-        vin_resp.raise_for_status()
-        vin_data = await vin_resp.json()
-        vin = vin_data.get("vin")
+        if auth.version == "v2":
+            vin_resp = await auth.request_v2("get", f"vehicles/{vehicle_id}/vin")
+            vin_resp.raise_for_status()
+            vin_data = await vin_resp.json()
+            vin = vin_data.get("vin")
+        else:
+            assert auth.version == "v3"
+            signals_resp = await auth.request_v3(
+                "get",
+                f"vehicles/{vehicle_id}/signals/vehicleidentification-vin",
+            )
+            signals_resp.raise_for_status()
+            signals_data = await signals_resp.json()
+            vehicle_info = (
+                signals_data.get("included", {})
+                .get("vehicle", {})
+                .get("attributes", {})
+            )
+
+            vin = (
+                signals_data.get("data", {})
+                .get("attributes", {})
+                .get("body", {})
+                .get("value", None)
+            )
 
         if not vin:
             msg = f"No VIN for vehicle {vehicle_id}"
-            raise MissingVINError(msg)
+            vin = "missing"
 
         data["vehicles"][vehicle_id] = {
             "vin": vin,
         }
 
-        _LOGGER.debug("Fetching attributes for vehicle ID: %s", vehicle_id)
-        attr_resp = await auth.request(
-            "get",
-            f"vehicles/{vehicle_id}",
-        )
-        attr_resp.raise_for_status()
-        vehicle_info = await attr_resp.json()
+        if auth.version == "v2":
+            _LOGGER.debug("Fetching attributes for vehicle ID: %s", vehicle_id)
+            attr_resp = await auth.request_v2("get", f"vehicles/{vehicle_id}")
+            attr_resp.raise_for_status()
+            vehicle_info = await attr_resp.json()
+
         make = vehicle_info.get("make")
         model = vehicle_info.get("model")
-        year = vehicle_info.get("year")
+        year = str(vehicle_info.get("year"))
 
         data["vehicles"][vehicle_id].update(
             {

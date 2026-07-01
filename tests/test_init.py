@@ -23,7 +23,7 @@ from custom_components.smartcar.const import (
     EntityDescriptionKey,
 )
 
-from . import MOCK_API_ENDPOINT, setup_added_integration, setup_integration
+from . import MOCK_API_ENDPOINT_LEGACY, setup_added_integration, setup_integration
 
 
 async def test_async_setup(hass: HomeAssistant):
@@ -64,6 +64,7 @@ async def test_standard_setup(
         assert hass.states.get(entity.entity_id) == snapshot(name=entity.entity_id)
 
 
+@pytest.mark.parametrize("client_id_version", ["v2", "v3"])
 @pytest.mark.usefixtures("enable_all_entities")
 async def test_standard_setup_with_all_entities(
     hass: HomeAssistant,
@@ -403,16 +404,16 @@ async def test_migration(
     )
 
     aioclient_mock.get(
-        f"{MOCK_API_ENDPOINT}/v2.0/vehicles",
+        f"{MOCK_API_ENDPOINT_LEGACY}/vehicles",
         json=({"paging": {"count": 25, "offset": 0}, "vehicles": api_vehicle_ids}),
     )
     for vehicle_id in api_vehicle_ids:
         aioclient_mock.get(
-            f"{MOCK_API_ENDPOINT}/v2.0/vehicles/{vehicle_id}/vin",
+            f"{MOCK_API_ENDPOINT_LEGACY}/vehicles/{vehicle_id}/vin",
             json={"vin": f"mock-vin-for-${vehicle_id}"},
         )
         aioclient_mock.get(
-            f"{MOCK_API_ENDPOINT}/v2.0/vehicles/{vehicle_id}",
+            f"{MOCK_API_ENDPOINT_LEGACY}/vehicles/{vehicle_id}",
             json=(
                 {
                     "id": vehicle_id,
